@@ -376,7 +376,7 @@ extension DatabasePool: DatabaseReader {
                 reader.async { db in
                     defer {
                         try? db.commit() // Ignore commit error
-                        releaseReader()
+                        releaseReader(.reuse)
                     }
                     do {
                         // The block isolation comes from the DEFERRED transaction.
@@ -419,7 +419,7 @@ extension DatabasePool: DatabaseReader {
                 // Second async jump because that's how `Pool.async` has to be used.
                 reader.async { db in
                     defer {
-                        releaseReader()
+                        releaseReader(.reuse)
                     }
                     do {
                         // The block isolation comes from the DEFERRED transaction.
@@ -536,7 +536,7 @@ extension DatabasePool: DatabaseReader {
             reader.async { db in
                 defer {
                     try? db.commit() // Ignore commit error
-                    releaseReader()
+                    releaseReader(.reuse)
                 }
                 do {
                     // https://www.sqlite.org/isolation.html
@@ -644,7 +644,44 @@ extension DatabasePool: DatabaseReader {
         // in the pool, and thus still relevant for our check:
         return readers.first { $0.onValidQueue }
     }
-    
+
+    // MARK: - WAL Snapshot Transactions
+
+    // swiftlint:disable:next line_length
+#if SQLITE_ENABLE_SNAPSHOT || (!GRDBCUSTOMSQLITE && !GRDBCIPHER && (compiler(>=5.7.1) || !(os(macOS) || targetEnvironment(macCatalyst))))
+    /// Returns a long-lived WAL snapshot transaction on one of the
+    /// reader connections.
+    func walSnapshotTransaction() throws -> WALSnapshotTransaction {
+        guard let readerPool else {
+            throw DatabaseError.connectionIsClosed()
+        }
+
+        let (reader, releaseReader) = try readerPool.get()
+        return try WALSnapshotTransaction(reader: reader) { transactionCompleted in
+            releaseReader(transactionCompleted ? .reuse : .discard)
+        }
+    }
+
+    /// Returns a long-lived WAL snapshot transaction on one of the
+    /// reader connections.
+    func asyncWALSnapshotTransaction(_ completion: @escaping (Result<WALSnapshotTransaction, Error>) -> Void) {
+        guard let readerPool else {
+            completion(.failure(DatabaseError.connectionIsClosed()))
+            return
+        }
+
+        readerPool.asyncGet { result in
+            completion(result.flatMap { reader, releaseReader in
+                Result {
+                    try WALSnapshotTransaction(reader: reader) { transactionCompleted in
+                        releaseReader(transactionCompleted ? .reuse : .discard)
+                    }
+                }
+            })
+        }
+    }
+#endif
+
     // MARK: - Writing in Database
     
     @_disfavoredOverload // SR-15150 Async overloading in protocol implementation fails

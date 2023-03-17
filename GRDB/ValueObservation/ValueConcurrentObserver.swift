@@ -1,5 +1,80 @@
 import Foundation
 
+// swiftlint:disable:next line_length
+#if SQLITE_ENABLE_SNAPSHOT || (!GRDBCUSTOMSQLITE && !GRDBCIPHER && (compiler(>=5.7.1) || !(os(macOS) || targetEnvironment(macCatalyst))))
+/// A long-live read-only WAL transaction.
+///
+/// `WALSnapshotTransaction` **takes ownership** of its reader
+/// `SerializedDatabase` (TODO: make it a move-only type eventually).
+class WALSnapshotTransaction {
+    private let reader: SerializedDatabase
+    private let transactionDidComplete: (Bool) -> Void
+
+    /// The state of the database at the beginning of the transaction.
+    let walSnapshot: WALSnapshot
+
+    /// Creates a long-live WAL transaction on a read-only connection.
+    ///
+    /// The `transactionDidComplete` closure is called when the
+    /// `WALSnapshotTransaction` is deallocated, or if the
+    /// initializer throws. Its argument tells if the long-lived
+    /// transaction could be properly terminated.
+    ///
+    /// - parameter reader: A read-only database connection.
+    /// - parameter transactionDidComplete: A closure to call when the
+    ///   snapshot transaction ends.
+    init(
+        reader: SerializedDatabase,
+        transactionDidComplete: @escaping (Bool) -> Void)
+    throws
+    {
+        assert(reader.configuration.readonly)
+
+        // Open a transaction and enter snapshot isolation
+        reader.allowsUnsafeTransactions = true
+        do {
+            try reader.sync { db in
+                try db.beginTransaction(.deferred)
+                try db.execute(sql: "SELECT rootpage FROM sqlite_master LIMIT 1")
+            }
+        } catch {
+            // self is not initialized, so deinit will not run.
+            Self.commitAndRelease(reader: reader, transactionDidComplete: transactionDidComplete)
+            throw error
+        }
+
+        self.reader = reader
+        self.transactionDidComplete = transactionDidComplete
+        self.walSnapshot = try reader.sync { db in
+            return WALSnapshot(db)!
+        }
+    }
+
+    deinit {
+        Self.commitAndRelease(reader: reader, transactionDidComplete: transactionDidComplete)
+    }
+
+    /// Executes database operations in the snapshot transaction, and
+    /// returns their result after they have finished executing.
+    func read<T>(_ value: (Database) throws -> T) rethrows -> T {
+        // TODO: we should check the validity of the snapshot, as DatabaseSnapshotPool does.
+        try reader.sync(value)
+    }
+
+    private static func commitAndRelease(
+        reader: SerializedDatabase,
+        transactionDidComplete: (Bool) -> Void)
+    {
+        reader.allowsUnsafeTransactions = false
+        let success = reader.sync { db in
+            try? db.commit()
+            return db.isInsideTransaction
+        }
+        transactionDidComplete(success)
+    }
+}
+#endif
+
 /// `ValueConcurrentObserver` observes the database for `ValueObservation`, in
 /// a `DatabasePool`.
 ///
@@ -229,7 +304,7 @@ extension ValueConcurrentObserver {
         // some closure waiting to run in some DispatchQueue.
         return AnyDatabaseCancellable(self)
     }
-    
+
     private func startObservation(_ writerDB: Database, observedRegion: DatabaseRegion) {
         observationState.region = observedRegion
         assert(observationState.isModified == false)
@@ -237,8 +312,8 @@ extension ValueConcurrentObserver {
     }
 }
 
-// MARK: - Starting the Observation (with SQLITE_ENABLE_SNAPSHOT)
-
+// swiftlint:disable:next line_length
+#if SQLITE_ENABLE_SNAPSHOT || (!GRDBCUSTOMSQLITE && !GRDBCIPHER && (compiler(>=5.7.1) || !(os(macOS) || targetEnvironment(macCatalyst))))
 extension ValueConcurrentObserver {
     /// Synchronously starts the observation, and returns the initial value.
     ///
@@ -249,24 +324,17 @@ extension ValueConcurrentObserver {
         // without having to wait for an eventual long-running write
         // transaction to complete.
         //
-        // Fetch value & tracked region in a synchronous way.
-        //
-        // TODO: we currently perform the initial read from a snapshot, because
-        // it is a handy way to keep a read transaction open until we grab a
-        // write access, and compare the database versions. The problem is that
-        // we do not control the number of created shapshots: we should instead
-        // use a reader from the pool.
-        let initialSnapshot = try databaseAccess.dbPool.makeSnapshot()
-        let (fetchedValue, initialRegion, initialWALSnapshot) = try initialSnapshot.read {
-            db -> (Reducer.Fetched, DatabaseRegion, WALSnapshot?) in
-            // swiftlint:disable:previous closure_parameter_position
-            
+        // We perform the initial read from a long-lived WAL snapshot
+        // transaction, because it is a handy way to keep a read transaction
+        // open until we grab a write access, and compare the database versions.
+        let walSnapshotTransaction = try databaseAccess.dbPool.walSnapshotTransaction()
+        let (fetchedValue, initialRegion) = try walSnapshotTransaction.read { db -> (Reducer.Fetched, DatabaseRegion) in
             switch trackingMode {
             case let .constantRegion(regions):
                 let fetchedValue = try databaseAccess.fetch(db)
                 let region = try DatabaseRegion.union(regions)(db)
                 let initialRegion = try region.observableRegion(db)
-                return (fetchedValue, initialRegion, WALSnapshot(db))
+                return (fetchedValue, initialRegion)
                 
             case .constantRegionRecordedFromSelection,
                     .nonConstantRegionRecordedFromSelection:
@@ -275,7 +343,7 @@ extension ValueConcurrentObserver {
                     try databaseAccess.fetch(db)
                 }
                 let initialRegion = try region.observableRegion(db)
-                return (fetchedValue, initialRegion, WALSnapshot(db))
+                return (fetchedValue, initialRegion)
             }
         }
         
@@ -290,8 +358,7 @@ extension ValueConcurrentObserver {
         // Start observation
         asyncStartObservation(
             from: databaseAccess,
-            initialSnapshot: initialSnapshot,
-            initialWALSnapshot: initialWALSnapshot,
+            walSnapshotTransaction: walSnapshotTransaction,
             initialRegion: initialRegion)
         
         return initialValue
@@ -311,17 +378,20 @@ extension ValueConcurrentObserver {
         // write access, and compare the database versions. The problem is that
         // we do not control the number of created shapshots: we should instead
         // use a reader from the pool.
-        do {
-            let initialSnapshot = try databaseAccess.dbPool.makeSnapshot()
-            initialSnapshot.asyncRead { dbResult in
-                let isNotifying = self.lock.synchronized { self.notificationCallbacks != nil }
-                guard isNotifying else { return /* Cancelled */ }
-                
-                do {
-                    // Fetch
+        // We perform the initial read from a long-lived WAL snapshot
+        // transaction, because it is a handy way to keep a read transaction
+        // open until we grab a write access, and compare the database versions.
+        databaseAccess.dbPool.asyncWALSnapshotTransaction { result in
+            let isNotifying = self.lock.synchronized { self.notificationCallbacks != nil }
+            guard isNotifying else { return /* Cancelled */ }
+
+            do {
+                // Fetch
+                let walSnapshotTransaction = try result.get()
+                try walSnapshotTransaction.read { db in
                     let fetchedValue: Reducer.Fetched
                     let initialRegion: DatabaseRegion
-                    let db = try dbResult.get()
+
                     switch self.trackingMode {
                     case let .constantRegion(regions):
                         fetchedValue = try databaseAccess.fetch(db)
@@ -361,22 +431,19 @@ extension ValueConcurrentObserver {
                     // Start observation
                     self.asyncStartObservation(
                         from: databaseAccess,
-                        initialSnapshot: initialSnapshot,
-                        initialWALSnapshot: WALSnapshot(db),
+                        walSnapshotTransaction: walSnapshotTransaction,
                         initialRegion: initialRegion)
-                } catch {
-                    self.notifyError(error)
+
                 }
+            } catch {
+                self.notifyError(error)
             }
-        } catch {
-            self.notifyError(error)
         }
     }
     
     private func asyncStartObservation(
         from databaseAccess: DatabaseAccess,
-        initialSnapshot: DatabaseSnapshot,
-        initialWALSnapshot: WALSnapshot?,
+        walSnapshotTransaction: WALSnapshotTransaction,
         initialRegion: DatabaseRegion)
     {
         databaseAccess.dbPool.asyncWriteWithoutTransaction { writerDB in
@@ -393,13 +460,11 @@ extension ValueConcurrentObserver {
                     // database versions. It prevents database checkpointing,
                     // and keeps WAL snapshots (`sqlite3_snapshot`) valid
                     // and comparable.
-                    let isModified: Bool = withExtendedLifetime(initialSnapshot) {
-                        guard let initialWALSnapshot = initialWALSnapshot,
-                              let currentWALSnapshot = WALSnapshot(writerDB)
-                        else {
+                    let isModified = withExtendedLifetime(walSnapshotTransaction) {
+                        guard let currentWALSnapshot = try? WALSnapshot(writerDB) else {
                             return true
                         }
-                        let ordering = initialWALSnapshot.compare(currentWALSnapshot)
+                        let ordering = walSnapshotTransaction.walSnapshot.compare(currentWALSnapshot)
                         assert(ordering <= 0, "Unexpected snapshot ordering")
                         return ordering < 0
                     }
@@ -461,6 +526,230 @@ extension ValueConcurrentObserver {
         }
     }
 }
+#else
+extension ValueConcurrentObserver {
+    /// Synchronously starts the observation, and returns the initial value.
+    ///
+    /// Unlike `asyncStart()`, this method does not notify the initial value or error.
+    private func syncStart(from databaseAccess: DatabaseAccess) throws -> Reducer.Value {
+        // Start from a read access. The whole point of using a DatabasePool
+        // for observing the database is to be able to fetch the initial value
+        // without having to wait for an eventual long-running write
+        // transaction to complete.
+        //
+        // Fetch value & tracked region in a synchronous way.
+        //
+        // TODO: we currently perform the initial read from a snapshot, because
+        // it is a handy way to keep a read transaction open until we grab a
+        // write access, and compare the database versions. The problem is that
+        // we do not control the number of created shapshots: we should instead
+        // use a reader from the pool.
+        let initialSnapshot = try databaseAccess.dbPool.makeSnapshot()
+        let (fetchedValue, initialRegion, initialWALSnapshot) = try initialSnapshot.read {
+            db -> (Reducer.Fetched, DatabaseRegion, WALSnapshot?) in
+            // swiftlint:disable:previous closure_parameter_position
+
+            switch trackingMode {
+            case let .constantRegion(regions):
+                let fetchedValue = try databaseAccess.fetch(db)
+                let region = try DatabaseRegion.union(regions)(db)
+                let initialRegion = try region.observableRegion(db)
+                return (fetchedValue, initialRegion, WALSnapshot(db))
+
+            case .constantRegionRecordedFromSelection,
+                    .nonConstantRegionRecordedFromSelection:
+                var region = DatabaseRegion()
+                let fetchedValue = try db.recordingSelection(&region) {
+                    try databaseAccess.fetch(db)
+                }
+                let initialRegion = try region.observableRegion(db)
+                return (fetchedValue, initialRegion, WALSnapshot(db))
+            }
+        }
+
+        // Reduce
+        let initialValue: Reducer.Value = reduceQueue.sync {
+            guard let initialValue = reducer._value(fetchedValue) else {
+                fatalError("Broken contract: reducer has no initial value")
+            }
+            return initialValue
+        }
+
+        // Start observation
+        asyncStartObservation(
+            from: databaseAccess,
+            initialSnapshot: initialSnapshot,
+            initialWALSnapshot: initialWALSnapshot,
+            initialRegion: initialRegion)
+
+        return initialValue
+    }
+
+    /// Asynchronously starts the observation
+    ///
+    /// Unlike `syncStart()`, this method does notify the initial value or error.
+    private func asyncStart(from databaseAccess: DatabaseAccess) {
+        // Start from a read access. The whole point of using a DatabasePool
+        // for observing the database is to be able to fetch the initial value
+        // without having to wait for an eventual long-running write
+        // transaction to complete.
+        //
+        // TODO: we currently perform the initial read from a snapshot, because
+        // it is a handy way to keep a read transaction open until we grab a
+        // write access, and compare the database versions. The problem is that
+        // we do not control the number of created shapshots: we should instead
+        // use a reader from the pool.
+        do {
+            let initialSnapshot = try databaseAccess.dbPool.makeSnapshot()
+            initialSnapshot.asyncRead { dbResult in
+                let isNotifying = self.lock.synchronized { self.notificationCallbacks != nil }
+                guard isNotifying else { return /* Cancelled */ }
+
+                do {
+                    // Fetch
+                    let fetchedValue: Reducer.Fetched
+                    let initialRegion: DatabaseRegion
+                    let db = try dbResult.get()
+                    switch self.trackingMode {
+                    case let .constantRegion(regions):
+                        fetchedValue = try databaseAccess.fetch(db)
+                        let region = try DatabaseRegion.union(regions)(db)
+                        initialRegion = try region.observableRegion(db)
+
+                    case .constantRegionRecordedFromSelection,
+                            .nonConstantRegionRecordedFromSelection:
+                        var region = DatabaseRegion()
+                        fetchedValue = try db.recordingSelection(&region) {
+                            try databaseAccess.fetch(db)
+                        }
+                        initialRegion = try region.observableRegion(db)
+                    }
+
+                    // Reduce
+                    //
+                    // Reducing is performed asynchronously, so that we do not lock
+                    // a database dispatch queue longer than necessary.
+                    self.reduceQueue.async {
+                        let isNotifying = self.lock.synchronized { self.notificationCallbacks != nil }
+                        guard isNotifying else { return /* Cancelled */ }
+
+                        guard let initialValue = self.reducer._value(fetchedValue) else {
+                            fatalError("Broken contract: reducer has no initial value")
+                        }
+
+                        // Notify
+                        self.scheduler.schedule {
+                            // TODO: [SR-214] remove -Opt suffix when we only support Xcode 12.5.1+
+                            let onChangeOpt = self.lock.synchronized { self.notificationCallbacks?.onChange }
+                            guard let onChange = onChangeOpt else { return /* Cancelled */ }
+                            onChange(initialValue)
+                        }
+                    }
+
+                    // Start observation
+                    self.asyncStartObservation(
+                        from: databaseAccess,
+                        initialSnapshot: initialSnapshot,
+                        initialWALSnapshot: WALSnapshot(db),
+                        initialRegion: initialRegion)
+                } catch {
+                    self.notifyError(error)
+                }
+            }
+        } catch {
+            self.notifyError(error)
+        }
+    }
+
+    private func asyncStartObservation(
+        from databaseAccess: DatabaseAccess,
+        initialSnapshot: DatabaseSnapshot,
+        initialWALSnapshot: WALSnapshot?,
+        initialRegion: DatabaseRegion)
+    {
+        databaseAccess.dbPool.asyncWriteWithoutTransaction { writerDB in
+            // TODO: [SR-214] remove -Opt suffix when we only support Xcode 12.5.1+
+            let eventsOpt = self.lock.synchronized { self.notificationCallbacks?.events }
+            guard let events = eventsOpt else { return /* Cancelled */ }
+
+            do {
+                var observedRegion = initialRegion
+
+                // Transaction is needed for comparing version snapshots
+                try writerDB.isolated(readOnly: true) {
+                    // Keep DatabaseSnaphot alive until we have compared
+                    // database versions. It prevents database checkpointing,
+                    // and keeps WAL snapshots (`sqlite3_snapshot`) valid
+                    // and comparable.
+                    let isModified: Bool = withExtendedLifetime(initialSnapshot) {
+                        guard let initialWALSnapshot = initialWALSnapshot,
+                              let currentWALSnapshot = WALSnapshot(writerDB)
+                        else {
+                            return true
+                        }
+                        let ordering = initialWALSnapshot.compare(currentWALSnapshot)
+                        assert(ordering <= 0, "Unexpected snapshot ordering")
+                        return ordering < 0
+                    }
+
+                    if isModified {
+                        events.databaseDidChange?()
+
+                        // Fetch
+                        let fetchedValue: Reducer.Fetched
+
+                        switch self.trackingMode {
+                        case .constantRegion:
+                            fetchedValue = try databaseAccess.fetch(writerDB)
+                            events.willTrackRegion?(initialRegion)
+                            self.startObservation(writerDB, observedRegion: initialRegion)
+
+                        case .constantRegionRecordedFromSelection,
+                                .nonConstantRegionRecordedFromSelection:
+                            var region = DatabaseRegion()
+                            fetchedValue = try writerDB.recordingSelection(&region) {
+                                try databaseAccess.fetch(writerDB)
+                            }
+                            observedRegion = try region.observableRegion(writerDB)
+                            events.willTrackRegion?(observedRegion)
+                            self.startObservation(writerDB, observedRegion: observedRegion)
+                        }
+
+                        // Reduce
+                        //
+                        // Reducing is performed asynchronously, so that we do not lock
+                        // the writer dispatch queue longer than necessary.
+                        //
+                        // Important: reduceQueue.async guarantees the same ordering
+                        // between transactions and notifications!
+                        self.reduceQueue.async {
+                            let isNotifying = self.lock.synchronized { self.notificationCallbacks != nil }
+                            guard isNotifying else { return /* Cancelled */ }
+
+                            let value = self.reducer._value(fetchedValue)
+
+                            // Notify
+                            if let value = value {
+                                self.scheduler.schedule {
+                                    // TODO: [SR-214] remove -Opt suffix when we only support Xcode 12.5.1+
+                                    let onChangeOpt = self.lock.synchronized { self.notificationCallbacks?.onChange }
+                                    guard let onChange = onChangeOpt else { return /* Cancelled */ }
+                                    onChange(value)
+                                }
+                            }
+                        }
+                    } else {
+                        events.willTrackRegion?(initialRegion)
+                        self.startObservation(writerDB, observedRegion: initialRegion)
+                    }
+                }
+            } catch {
+                self.notifyError(error)
+            }
+        }
+    }
+}
+#endif
 
 // MARK: - Observing Database Transactions
 

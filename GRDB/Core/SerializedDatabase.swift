@@ -13,7 +13,12 @@ final class SerializedDatabase {
     
     /// The dispatch queue
     private let queue: DispatchQueue
-    
+
+    /// If true, overrides `configuration.allowsUnsafeTransactions`.
+    ///
+    /// See `WALSnapshotTransaction`.
+    var allowsUnsafeTransactions = false
+
     init(
         path: String,
         configuration: Configuration = Configuration(),
@@ -242,7 +247,7 @@ final class SerializedDatabase {
         line: UInt = #line)
     {
         GRDBPrecondition(
-            configuration.allowsUnsafeTransactions || !db.isInsideTransaction,
+            allowsUnsafeTransactions || configuration.allowsUnsafeTransactions || !db.isInsideTransaction,
             message(),
             file: file,
             line: line)
